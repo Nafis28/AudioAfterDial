@@ -6,7 +6,7 @@ Current Issue
 424 Failed Dependency
 
 
-#HowTOrun
+# HowTOrun
 Install all Dependancy
 
 node script.js
