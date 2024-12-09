@@ -6,16 +6,21 @@ const { ReadableStream } = require('stream/web');
 const https = require('https');
 const http = require('http');
 const FormData = require('form-data');
+const jwt = require('jsonwebtoken');
+require('dotenv').config(); // If using environment variables
 
 // Configuration Constants
-const API_BASE_URL = 'https://example.3cx.com.au'; // Replace with your 3CX PBX API base URL
-const APP_ID = 'nafistest'; // Replace with your App ID
-const APP_SECRET = '##################'; // Replace  App Secret
-const DN_NUMBER = '111'; // manual setup for now - add extension number thats dialing out
-const AUDIO_FILE = '.../path//'; // Path to your .wav audio file
+const API_BASE_URL = process.env.API_BASE_URL || 'https://example.3cx.com.au'; // 3CX PBX API base URL
+const APP_ID = process.env.APP_ID; // App ID
+const APP_SECRET = process.env.APP_SECRET; // App Secret
+const DN_NUMBER = process.env.DN_NUMBER || '111'; // Extension number dialing out
+const AUDIO_FILE = process.env.AUDIO_FILE || 'C:/Users/n_a_f/Documents/Aatrox/CPA/Webhook/Nafismusic_compatible.wav'; // Path to .wav audio file
 
 // Event Emitter for WebSocket events
 const eventEmitter = new EventEmitter();
+
+// Token variable
+let accessToken = '';
 
 // Function to receive access token
 async function receiveToken() {
@@ -24,26 +29,72 @@ async function receiveToken() {
     formParams.append('client_id', APP_ID);
     formParams.append('client_secret', APP_SECRET);
     formParams.append('grant_type', 'client_credentials');
+    // Append scope if required
+    // formParams.append('scope', 'required_scope_here'); 
 
     try {
         const response = await axios.post(tokenUrl, formParams, {
             headers: formParams.getHeaders(),
         });
-        return `Bearer ${response.data.access_token}`;
+        accessToken = `Bearer ${response.data.access_token}`;
+        console.log(`[receiveToken] Access token received: ${accessToken.substring(0, 30)}...`);
+        return accessToken;
     } catch (error) {
         console.error('Error fetching token:', error.response?.data || error.message);
         throw new Error('Unable to receive access token');
     }
 }
 
+// Function to validate if token is expired
+function isTokenExpired(token) {
+    try {
+        const decoded = jwt.decode(token.split(' ')[1]);
+        const currentTime = Math.floor(Date.now() / 1000);
+        const expired = decoded.exp < currentTime;
+        if (expired) {
+            console.log('[isTokenExpired] Token has expired.');
+        }
+        return expired;
+    } catch (error) {
+        console.error('[isTokenExpired] Error decoding token:', error.message);
+        return true;
+    }
+}
+
+// Function to make authenticated GET requests with automatic token refresh
+async function authenticatedGet(url) {
+    if (isTokenExpired(accessToken)) {
+        console.log('[authenticatedGet] Token expired. Refreshing token...');
+        await receiveToken();
+    }
+
+    try {
+        const response = await axios.get(url, {
+            headers: {
+                Authorization: accessToken,
+            },
+        });
+        return response.data;
+    } catch (error) {
+        if (error.response && error.response.status === 401) {
+            console.warn('[authenticatedGet] Received 401. Refreshing token and retrying...');
+            await receiveToken();
+            const retryResponse = await axios.get(url, {
+                headers: {
+                    Authorization: accessToken,
+                },
+            });
+            return retryResponse.data;
+        } else {
+            throw error;
+        }
+    }
+}
+
 // Function to fetch participant status
 async function getParticipantStatus(participantId, token) {
     try {
-        const response = await axios.get(`${API_BASE_URL}/callcontrol/${DN_NUMBER}/participants/${participantId}`, {
-            headers: {
-                Authorization: token,
-            },
-        });
+        const response = await authenticatedGet(`${API_BASE_URL}/callcontrol/${DN_NUMBER}/participants/${participantId}`);
         return response.data.status; 
     } catch (error) {
         console.error(`Error fetching status for participant ${participantId}:`, error.response?.data || error.message);
@@ -130,92 +181,145 @@ async function postAudioStream(source, participantId, bodyStream, cancelationTok
 
     try {
         for await (const chunk of readChunks(reader)) {
+            console.log(`[postAudioStream] Writing chunk of size: ${chunk.length}`);
             request.write(chunk);
         }
         request.end();
+        console.log('[postAudioStream] All chunks written. Ending request.');
     } catch (error) {
         console.error('Error during streaming:', error.message);
         request.abort();
     }
 }
 
-// Function to stream WAV audio to a participant
+// Function to stream WAV audio to a participant with enhanced logging
 async function playWavAudio(participantId, token) {
     try {
-        console.log(`Preparing to stream WAV audio to participant ID: ${participantId}`);
+        console.log(`[playWavAudio] Preparing to stream WAV audio to participant ID: ${participantId}`);
 
+        // Check if the audio file exists
         if (!fs.existsSync(AUDIO_FILE)) {
+            console.error(`[playWavAudio] Error: Audio file not found at path: ${AUDIO_FILE}`);
             throw new Error(`Audio file not found: ${AUDIO_FILE}`);
         }
+        console.log(`[playWavAudio] Audio file found: ${AUDIO_FILE}`);
 
+        // Create a readable stream for the audio file
         const audioStream = fs.createReadStream(AUDIO_FILE);
+        console.log(`[playWavAudio] Audio stream created for file: ${AUDIO_FILE}`);
+
+        // Create a ReadableStream wrapper
         const readableStream = new ReadableStream({
             start(controller) {
-                audioStream.on('data', (chunk) => controller.enqueue(chunk));
-                audioStream.on('end', () => controller.close());
-                audioStream.on('error', (error) => controller.error(error));
+                console.log(`[playWavAudio] Starting to read audio stream...`);
+                audioStream.on('data', (chunk) => {
+                    console.log(`[playWavAudio] Read chunk of size: ${chunk.length}`);
+                    controller.enqueue(chunk);
+                });
+                audioStream.on('end', () => {
+                    console.log(`[playWavAudio] Audio stream reading completed.`);
+                    controller.close();
+                });
+                audioStream.on('error', (error) => {
+                    console.error(`[playWavAudio] Error reading audio stream: ${error.message}`);
+                    controller.error(error);
+                });
             },
         });
 
+        // Create a cancellation token for handling interruptions
         const cancelationToken = {
             on: (event, callback) => {
-                if (event === 'cancel') process.on('SIGINT', callback);
+                if (event === 'cancel') {
+                    process.on('SIGINT', callback);
+                    console.log(`[playWavAudio] Cancellation token registered for SIGINT.`);
+                }
             },
         };
 
+        // Log start of the streaming process
+        console.log(`[playWavAudio] Starting to stream audio to participant ID: ${participantId}`);
         await postAudioStream(DN_NUMBER, participantId, readableStream, cancelationToken, token);
-        console.log('Audio streamed successfully.');
+
+        // Log success message
+        console.log(`[playWavAudio] Audio streamed successfully to participant ID: ${participantId}`);
     } catch (error) {
-        console.error('Error streaming WAV audio:', error.message);
+        // Log detailed error message
+        console.error(`[playWavAudio] Error streaming WAV audio to participant ID ${participantId}: ${error.message}`);
     }
 }
 
-// WebSocket handler
+// WebSocket handler with participant state tracking and token refresh
 async function setupWebSocket(token) {
     console.log('Setting up WebSocket connection...');
     const ws = new WebSocket(`${API_BASE_URL}/callcontrol/ws`, {
         headers: { Authorization: token },
     });
 
+    // Maintain a map to track participant statuses
+    const participantStates = new Map();
+
     ws.on('open', () => {
-        console.log('WebSocket connected.');
-        ws.send(JSON.stringify({ action: 'subscribe', path: '/callcontrol' }));
-        console.log('Subscribed to /callcontrol path.');
+        console.log(`[WebSocket] Connection established at ${new Date().toISOString()}`);
     });
 
-    ws.on('message', async (message) => {
+    ws.on('message', async (data) => {
+        console.log(`[WebSocket] Message received at ${new Date().toISOString()}`);
         try {
-            const data = JSON.parse(message);
-            console.log('WebSocket message received:', data);
+            const eventData = JSON.parse(data.toString());
+            console.log('[WebSocket] Parsed message data:', JSON.stringify(eventData, null, 2));
 
-            const { event_type, entity } = data.event;
+            // Check if the message contains a participant entity
+            const entityPath = eventData?.event?.entity;
+            if (entityPath && entityPath.includes('/participants/')) {
+                console.log(`[WebSocket] Participant entity detected: ${entityPath}`);
 
-            if (event_type === 0 && entity.includes('participants')) {
-                const participantId = entity.split('/').pop();
-                console.log(`Detected participant change. Participant ID: ${participantId}`);
+                const participantId = entityPath.split('/').pop();
 
-                const status = await getParticipantStatus(participantId, token);
-                console.log(`Participant ${participantId} status: ${status}`);
+                try {
+                    // Fetch participant details using authenticatedGet
+                    const participantData = await authenticatedGet(`${API_BASE_URL}${entityPath}`);
 
-                if (status === 'Connected') {
-                    console.log(`Participant is connected. Streaming audio to participant ID: ${participantId}`);
-                    await playWavAudio(participantId, token);
-                } else {
-                    console.log(`Participant status ${status} is not ready for streaming.`);
+                    const { id, status, callid, party_caller_name, party_dn } = participantData;
+
+                    // Log participant details only if the status has changed
+                    if (participantStates.get(id) !== status) {
+                        participantStates.set(id, status); // Update the status
+                        console.log(`[WebSocket] Updated Participant Details:
+    - Participant ID: ${id}
+    - Status: ${status}
+    - Caller Name: ${party_caller_name || 'N/A'}
+    - Called DN: ${party_dn}
+    - Call ID: ${callid}`);
+                    }
+
+                    // Handle connected status
+                    if (status === 'Connected') {
+                        console.log(`[WebSocket] Participant ${id} is connected. Preparing to stream audio.`);
+                        await playWavAudio(participantId, accessToken);
+                    }
+                } catch (error) {
+                    console.error(`[WebSocket] Error fetching details for entity ${entityPath}:`, 
+                                  error.response?.data || error.message);
                 }
+            } else {
+                console.log('[WebSocket] Message does not contain participant entity. Full data:', eventData);
             }
         } catch (error) {
-            console.error('Error processing WebSocket message:', error.message);
+            console.error('[WebSocket] Error processing message:', error.message, data.toString());
         }
     });
 
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error.message);
+    ws.on('close', (code, reason) => {
+        console.log(`[WebSocket] Connection closed at ${new Date().toISOString()}.
+        Code: ${code}, Reason: ${reason}`);
+        console.log('Attempting to reconnect in 5 seconds...');
+        setTimeout(() => setupWebSocket(accessToken), 5000);
     });
 
-    ws.on('close', () => {
-        console.log('WebSocket closed. Reconnecting in 5 seconds...');
-        setTimeout(() => setupWebSocket(token), 5000);
+    ws.on('error', (error) => {
+        console.error(`[WebSocket] Error at ${new Date().toISOString()}:`, error.message);
+        ws.close();
     });
 }
 
@@ -231,9 +335,8 @@ async function main() {
     console.log(`Audio file located: ${AUDIO_FILE}`);
 
     try {
-        const token = await receiveToken();
-        await setupWebSocket(token);
-
+        await receiveToken();
+        await setupWebSocket(accessToken);
     } catch (error) {
         console.error('Error initializing application:', error.message);
         process.exit(1);
